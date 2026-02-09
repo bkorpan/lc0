@@ -73,6 +73,70 @@ void ApplyDirichletNoise(classic::Node* node, float eps, double alpha) {
   }
 }
 
+// Copied from search.cc (anonymous namespace there).
+class MEvaluator {
+ public:
+  MEvaluator()
+      : enabled_{false},
+        m_slope_{0.0f},
+        m_cap_{0.0f},
+        a_constant_{0.0f},
+        a_linear_{0.0f},
+        a_square_{0.0f},
+        q_threshold_{0.0f},
+        parent_m_{0.0f} {}
+
+  MEvaluator(const classic::SearchParams& params,
+             const classic::Node* parent = nullptr)
+      : enabled_{true},
+        m_slope_{params.GetMovesLeftSlope()},
+        m_cap_{params.GetMovesLeftMaxEffect()},
+        a_constant_{params.GetMovesLeftConstantFactor()},
+        a_linear_{params.GetMovesLeftScaledFactor()},
+        a_square_{params.GetMovesLeftQuadraticFactor()},
+        q_threshold_{params.GetMovesLeftThreshold()},
+        parent_m_{parent ? parent->GetM() : 0.0f},
+        parent_within_threshold_{parent ? WithinThreshold(parent, q_threshold_)
+                                        : false} {}
+
+  void SetParent(const classic::Node* parent) {
+    assert(parent);
+    if (enabled_) {
+      parent_m_ = parent->GetM();
+      parent_within_threshold_ = WithinThreshold(parent, q_threshold_);
+    }
+  }
+
+  float GetMUtility(classic::Node* child, float q) const {
+    if (!enabled_ || !parent_within_threshold_) return 0.0f;
+    const float child_m = child->GetM();
+    float m = std::clamp(m_slope_ * (child_m - parent_m_), -m_cap_, m_cap_);
+    m *= FastSign(-q);
+    if (q_threshold_ > 0.0f && q_threshold_ < 1.0f) {
+      q = std::max(0.0f, (std::abs(q) - q_threshold_)) / (1.0f - q_threshold_);
+    }
+    m *= a_constant_ + a_linear_ * std::abs(q) + a_square_ * q * q;
+    return m;
+  }
+
+  float GetDefaultMUtility() const { return 0.0f; }
+
+ private:
+  static bool WithinThreshold(const classic::Node* parent, float q_threshold) {
+    return std::abs(parent->GetQ(0.0f)) > q_threshold;
+  }
+
+  const bool enabled_;
+  const float m_slope_;
+  const float m_cap_;
+  const float a_constant_;
+  const float a_linear_;
+  const float a_square_;
+  const float q_threshold_;
+  float parent_m_ = 0.0f;
+  bool parent_within_threshold_ = false;
+};
+
 }  // namespace
 
 BatchedSelfPlay::BatchedSelfPlay(PlayerOptions player, int visits_per_move,
@@ -82,6 +146,7 @@ BatchedSelfPlay::BatchedSelfPlay(PlayerOptions player, int visits_per_move,
       params_(*player.uci_options),
       visits_per_move_(visits_per_move),
       syzygy_tb_(syzygy_tb) {
+  has_mlh_ = player_.backend->GetAttributes().has_mlh;
   games_.reserve(openings.size());
   for (const auto& opening : openings) {
     games_.push_back(GameState{
@@ -146,6 +211,42 @@ void BatchedSelfPlay::Play() {
           Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
           game.visits_this_move++;
           continue;
+        }
+
+        // Draw-by-rule and TwoFold draw detection (matching ExtendNode in
+        // search.cc). Only for non-root nodes.
+        if (leaf != game.tree->GetCurrentHead()) {
+          if (!board.HasMatingMaterial()) {
+            leaf->MakeTerminal(GameResult::DRAW);
+            Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+            game.visits_this_move++;
+            continue;
+          }
+          if (history.Last().GetRule50Ply() >= 100) {
+            leaf->MakeTerminal(GameResult::DRAW);
+            Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+            game.visits_this_move++;
+            continue;
+          }
+          const auto repetitions = history.Last().GetRepetitions();
+          if (repetitions >= 2) {
+            leaf->MakeTerminal(GameResult::DRAW);
+            Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+            game.visits_this_move++;
+            continue;
+          } else if (repetitions == 1 && params_.GetTwoFoldDraws()) {
+            const int depth = static_cast<int>(path.size()) - 1;
+            const auto cycle_length =
+                history.Last().GetPliesSincePrevRepetition();
+            if (depth >= 4 && depth >= cycle_length) {
+              leaf->MakeTerminal(GameResult::DRAW,
+                                 static_cast<float>(cycle_length),
+                                 classic::Node::Terminal::TwoFold);
+              Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+              game.visits_this_move++;
+              continue;
+            }
+          }
         }
 
         pending_leaves.push_back(LeafToEval{
@@ -214,6 +315,7 @@ classic::Node* BatchedSelfPlay::PuctWalk(
   path.push_back(node);
 
   const float draw_score = params_.GetDrawScore();
+  auto m_evaluator = has_mlh_ ? MEvaluator(params_) : MEvaluator();
 
   while (node->GetN() > 0 && !node->IsTerminal()) {
     bool at_root = (node == game.tree->GetCurrentHead());
@@ -221,15 +323,31 @@ classic::Node* BatchedSelfPlay::PuctWalk(
     float puct_mult =
         cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
     float fpu = GetFpu(params_, node, at_root, draw_score);
+    m_evaluator.SetParent(node);
 
     classic::Edge* best_edge = nullptr;
     classic::Node* best_child = nullptr;
     float best_score = -std::numeric_limits<float>::infinity();
 
+    // Edge examination limit: only look at NStarted + 3 edges (matching
+    // search.cc with cur_limit=1). Edges are sorted by policy descending.
+    const int max_needed = std::min(static_cast<int>(node->GetNumEdges()),
+                                    node->GetNStarted() + 3);
+    int edges_examined = 0;
+
     for (auto edge : node->Edges()) {
+      if (edges_examined >= max_needed) break;
+      edges_examined++;
+
       int n = edge.GetNStarted();
       float p = edge.GetP();
-      float q = (n > 0) ? edge.GetQ(fpu, draw_score) : fpu;
+      float q;
+      if (n > 0) {
+        q = edge.GetQ(fpu, draw_score);
+        q += m_evaluator.GetMUtility(edge.node(), q);
+      } else {
+        q = fpu;
+      }
       float score = q + p * puct_mult / (1 + n);
       if (score > best_score) {
         best_score = score;
@@ -239,6 +357,28 @@ classic::Node* BatchedSelfPlay::PuctWalk(
     }
 
     if (!best_edge) break;
+
+    // TwoFold depth correction on tree reuse: if the selected child was
+    // marked as a TwoFold terminal in a previous search but the repetition
+    // cycle now extends before the current root, revert it.
+    if (best_child->IsTwoFoldTerminal()) {
+      const int depth = static_cast<int>(path.size());
+      if (depth < best_child->GetM()) {
+        const auto wl = best_child->GetWL();
+        const auto d = best_child->GetD();
+        const auto m = best_child->GetM();
+        const auto terminal_visits = best_child->GetN();
+        int depth_counter = 0;
+        for (classic::Node* n = best_child; n != nullptr;
+             n = n->GetParent()) {
+          n->RevertTerminalVisits(wl, d, m + static_cast<float>(depth_counter),
+                                  terminal_visits);
+          depth_counter++;
+          if (depth_counter > depth) break;
+        }
+        best_child->MakeNotTerminal();
+      }
+    }
 
     Move move = best_edge->GetMove();
     history.Append(move);

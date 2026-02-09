@@ -89,6 +89,7 @@ class BatchedSelfPlay {
   int visits_per_move_;
   SyzygyTablebase* syzygy_tb_;
   bool abort_ = false;
+  bool has_mlh_ = false;
   std::vector<GameState> games_;
 };
 
