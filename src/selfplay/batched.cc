@@ -240,7 +240,7 @@ classic::Node* BatchedSelfPlay::PuctWalk(
 
     if (!best_edge) break;
 
-    Move move = best_edge->GetMove(/* as_opponent= */ true);
+    Move move = best_edge->GetMove();
     history.Append(move);
     node = best_child;
     path.push_back(node);
@@ -397,11 +397,10 @@ void BatchedSelfPlay::MakeGameMove(GameState& game) {
   game.move_count++;
   game.nodes_total += root->GetN();
 
-  // Advance game.
-  Move move_for_tree = played_move;
-  if (game.tree->IsBlackToMove()) move_for_tree.Flip();
+  // Advance game. Edge moves are already in the mirrored (side-to-move at
+  // bottom) format that NodeTree::MakeMove / PositionHistory::Append expects.
   game.tree->TrimTreeAtHead();
-  game.tree->MakeMove(move_for_tree);
+  game.tree->MakeMove(played_move);
 }
 
 void BatchedSelfPlay::CheckGameResult(GameState& game) {
