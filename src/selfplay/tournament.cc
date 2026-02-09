@@ -34,6 +34,7 @@
 #include "neural/shared_params.h"
 #include "search/classic/search.h"
 #include "search/classic/stoppers/factory.h"
+#include "selfplay/batched.h"
 #include "selfplay/game.h"
 #include "selfplay/multigame.h"
 #include "utils/optionsparser.h"
@@ -97,6 +98,10 @@ const OptionId kSyzygyTablebaseId{
     "List of Syzygy tablebase directories, list entries separated by system "
     "separator (\";\" for Windows, \":\" for Linux).",
     's'};
+const OptionId kBatchedGamesId{
+    "batched-games", "BatchedGames",
+    "Number of games per worker in cross-game batched MCTS mode. "
+    "Set to 0 to use standard per-game MCTS mode."};
 
 }  // namespace
 
@@ -136,6 +141,7 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<ChoiceOption>(kOpeningsModeId, openings_modes) = "sequential";
 
   options->Add<StringOption>(kSyzygyTablebaseId);
+  options->Add<IntOption>(kBatchedGamesId, 0, 1024) = 0;
   SelfPlayGame::PopulateUciParams(options);
 
   auto defaults = options->GetMutableDefaultsOptions();
@@ -177,7 +183,8 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
       kValueGamesSize(options.Get<int>(kValueModeSizeId)),
       kTournamentResultsFile(
           options.Get<std::string>(kTournamentResultsFileId)),
-      kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)) {
+      kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)),
+      kBatchedGamesSize(options.Get<int>(kBatchedGamesId)) {
   multi_games_size_ = std::max(kPolicyGamesSize, kValueGamesSize);
   std::string book = options.Get<std::string>(kOpeningsFileId);
   if (!book.empty()) {
@@ -534,6 +541,86 @@ void SelfPlayTournament::PlayMultiGames(int game_id, size_t game_count) {
   }
 }
 
+void SelfPlayTournament::PlayBatchedGames(int game_id, int count) {
+  std::vector<Opening> openings;
+  openings.reserve(count);
+  {
+    Mutex::Lock lock(mutex_);
+    for (int i = 0; i < count; i++) {
+      if (!openings_.empty()) {
+        if (player_options_[0][0].Get<bool>(kOpeningsMirroredId)) {
+          openings.push_back(openings_[((game_id + i) / 2) % openings_.size()]);
+        } else if (player_options_[0][0].Get<std::string>(kOpeningsModeId) ==
+                   "random") {
+          openings.push_back(
+              openings_[Random::Get().GetInt(0, openings_.size() - 1)]);
+        } else {
+          openings.push_back(openings_[(game_id + i) % openings_.size()]);
+        }
+      } else {
+        openings.push_back(Opening{});
+      }
+    }
+  }
+
+  int visits = search_limits_[0][0].visits;
+  if (visits <= 0) visits = 100;
+
+  PlayerOptions options;
+  options.backend = backends_[0][0].get();
+  options.uci_options = &player_options_[0][0];
+  options.search_limits = search_limits_[0][0];
+
+  std::list<std::unique_ptr<BatchedSelfPlay>>::iterator game_iter;
+  bool aborted = false;
+  {
+    Mutex::Lock lock(mutex_);
+    batched_games_.emplace_front(std::make_unique<BatchedSelfPlay>(
+        options, visits, openings, syzygy_tb_.get()));
+    game_iter = batched_games_.begin();
+    aborted = abort_;
+  }
+  auto& batched = **game_iter;
+
+  if (!aborted) batched.Play();
+
+  for (int i = 0; i < batched.NumGames(); i++) {
+    auto result = batched.GetGameResult(i);
+    if (result != GameResult::UNDECIDED) {
+      GameInfo game_info;
+      game_info.game_result = result;
+      game_info.is_black = false;
+      game_info.game_id = game_id + i;
+      game_info.moves = batched.GetMoves(i);
+      game_info.initial_fen = openings[i].start_fen;
+      game_info.play_start_ply = openings[i].moves.size();
+      if (kTraining) {
+        TrainingDataWriter writer(game_id + i);
+        batched.WriteTrainingData(i, &writer);
+        writer.Finalize();
+        game_info.training_filename = writer.GetFileName();
+      }
+      game_callback_(game_info);
+
+      {
+        Mutex::Lock lock(mutex_);
+        int r = result == GameResult::DRAW        ? 1
+                : result == GameResult::WHITE_WON ? 0
+                                                  : 2;
+        ++tournament_info_.results[r][0];
+        tournament_info_.move_count_ += batched.GetMoveCount(i);
+        tournament_info_.nodes_total_ += batched.GetNodesTotal(i);
+        tournament_callback_(tournament_info_);
+      }
+    }
+  }
+
+  {
+    Mutex::Lock lock(mutex_);
+    batched_games_.erase(game_iter);
+  }
+}
+
 void SelfPlayTournament::Worker() {
   // Play games while game limit is not reached (or while not aborted).
   while (true) {
@@ -542,7 +629,19 @@ void SelfPlayTournament::Worker() {
     {
       Mutex::Lock lock(mutex_);
       if (abort_) break;
-      if (multi_games_size_) {
+      if (kBatchedGamesSize > 0) {
+        int to_take = kBatchedGamesSize;
+        if (kTotalGames != -1) {
+          int cap = kTotalGames == -2
+                        ? static_cast<int>(openings_.size())
+                        : kTotalGames;
+          to_take = std::min(to_take, cap - games_count_);
+        }
+        if (to_take <= 0) break;
+        game_id = games_count_;
+        count = to_take;
+        games_count_ += to_take;
+      } else if (multi_games_size_) {
         if (!player_options_[0][0].Get<bool>(kOpeningsMirroredId)) {
           throw Exception(
               "Policy/Value multi games mode only supports mirrored openings.");
@@ -575,7 +674,9 @@ void SelfPlayTournament::Worker() {
         game_id = games_count_++;
       }
     }
-    if (multi_games_size_) {
+    if (kBatchedGamesSize > 0) {
+      PlayBatchedGames(game_id, count);
+    } else if (multi_games_size_) {
       PlayMultiGames(game_id, count);
     } else {
       PlayOneGame(game_id);
@@ -630,6 +731,8 @@ void SelfPlayTournament::Abort() {
   for (auto& game : games_)
     if (game) game->Abort();
   for (auto& game : multigames_)
+    if (game) game->Abort();
+  for (auto& game : batched_games_)
     if (game) game->Abort();
 }
 

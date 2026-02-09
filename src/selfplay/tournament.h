@@ -32,6 +32,7 @@
 #include "chess/pgn.h"
 #include "neural/backend.h"
 #include "neural/register.h"
+#include "selfplay/batched.h"
 #include "selfplay/game.h"
 #include "selfplay/multigame.h"
 #include "utils/mutex.h"
@@ -72,6 +73,7 @@ class SelfPlayTournament {
   void Worker();
   void PlayOneGame(int game_id);
   void PlayMultiGames(int game_id, size_t game_count);
+  void PlayBatchedGames(int game_id, int count);
   void SaveResults() REQUIRES(mutex_);
 
   Mutex mutex_;
@@ -88,6 +90,7 @@ class SelfPlayTournament {
   // to them and not worry that it becomes invalid.
   std::list<std::unique_ptr<SelfPlayGame>> games_ GUARDED_BY(mutex_);
   std::list<std::unique_ptr<MultiSelfPlayGames>> multigames_ GUARDED_BY(mutex_);
+  std::list<std::unique_ptr<BatchedSelfPlay>> batched_games_ GUARDED_BY(mutex_);
   // Place to store tournament stats.
   TournamentInfo tournament_info_ GUARDED_BY(mutex_);
 
@@ -112,6 +115,7 @@ class SelfPlayTournament {
   int multi_games_size_;
   const std::string kTournamentResultsFile;
   const float kDiscardedStartChance;
+  const int kBatchedGamesSize;
 };
 
 }  // namespace lczero

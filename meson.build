@@ -187,6 +187,7 @@ files += [
   'src/search/classic/stoppers/timemgr.cc',
   'src/search/classic/wrapper.cc',
   'src/search/register.cc',
+  'src/selfplay/batched.cc',
   'src/selfplay/game.cc',
   'src/selfplay/loop.cc',
   'src/selfplay/multigame.cc',
