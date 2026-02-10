@@ -325,14 +325,14 @@ classic::Node* BatchedSelfPlay::PuctWalk(
     float fpu = GetFpu(params_, node, at_root, draw_score);
     m_evaluator.SetParent(node);
 
-    classic::Edge* best_edge = nullptr;
-    classic::Node* best_child = nullptr;
+    classic::Node::Iterator best_edge_iter;
     float best_score = -std::numeric_limits<float>::infinity();
 
-    // Edge examination limit: only look at NStarted + 3 edges (matching
-    // search.cc with cur_limit=1). Edges are sorted by policy descending.
+    // Edge examination limit: NStarted + cur_limit + 2 (matching search.cc).
+    // In our single-visit walks, cur_limit=1 and we don't increment
+    // n_in_flight during the walk, so we add 1 to compensate, giving N + 4.
     const int max_needed = std::min(static_cast<int>(node->GetNumEdges()),
-                                    node->GetNStarted() + 3);
+                                    node->GetNStarted() + 4);
     int edges_examined = 0;
 
     for (auto edge : node->Edges()) {
@@ -351,12 +351,13 @@ classic::Node* BatchedSelfPlay::PuctWalk(
       float score = q + p * puct_mult / (1 + n);
       if (score > best_score) {
         best_score = score;
-        best_edge = edge.edge();
-        best_child = edge.GetOrSpawnNode(node);
+        best_edge_iter = edge;
       }
     }
 
-    if (!best_edge) break;
+    if (!best_edge_iter) break;
+    classic::Node* best_child = best_edge_iter.GetOrSpawnNode(node);
+    classic::Edge* best_edge = best_edge_iter.edge();
 
     // TwoFold depth correction on tree reuse: if the selected child was
     // marked as a TwoFold terminal in a previous search but the repetition
@@ -423,11 +424,16 @@ void BatchedSelfPlay::MakeGameMove(GameState& game) {
   const float draw_score = params_.GetDrawScore();
   const float fpu = GetFpu(params_, root, true, draw_score);
 
-  // Find best move by visit count (for best_eval).
+  // Find best move by visit count, breaking ties by Q then P
+  // (matching GetBestChildrenNoTemperature in search.cc).
   classic::EdgeAndNode best_edge;
   uint32_t max_n = 0;
   for (auto edge : root->Edges()) {
-    if (edge.GetN() > max_n) {
+    if (edge.GetN() > max_n ||
+        (edge.GetN() == max_n && max_n > 0 &&
+         (edge.GetQ(0.0f, draw_score) > best_edge.GetQ(0.0f, draw_score) ||
+          (edge.GetQ(0.0f, draw_score) == best_edge.GetQ(0.0f, draw_score) &&
+           edge.GetP() > best_edge.GetP())))) {
       max_n = edge.GetN();
       best_edge = edge;
     }
