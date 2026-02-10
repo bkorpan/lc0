@@ -541,28 +541,7 @@ void SelfPlayTournament::PlayMultiGames(int game_id, size_t game_count) {
   }
 }
 
-void SelfPlayTournament::PlayBatchedGames(int game_id, int count) {
-  std::vector<Opening> openings;
-  openings.reserve(count);
-  {
-    Mutex::Lock lock(mutex_);
-    for (int i = 0; i < count; i++) {
-      if (!openings_.empty()) {
-        if (player_options_[0][0].Get<bool>(kOpeningsMirroredId)) {
-          openings.push_back(openings_[((game_id + i) / 2) % openings_.size()]);
-        } else if (player_options_[0][0].Get<std::string>(kOpeningsModeId) ==
-                   "random") {
-          openings.push_back(
-              openings_[Random::Get().GetInt(0, openings_.size() - 1)]);
-        } else {
-          openings.push_back(openings_[(game_id + i) % openings_.size()]);
-        }
-      } else {
-        openings.push_back(Opening{});
-      }
-    }
-  }
-
+void SelfPlayTournament::PlayBatchedGames(int num_slots) {
   int visits = search_limits_[0][0].visits;
   if (visits <= 0) visits = 100;
 
@@ -571,49 +550,80 @@ void SelfPlayTournament::PlayBatchedGames(int game_id, int count) {
   options.uci_options = &player_options_[0][0];
   options.search_limits = search_limits_[0][0];
 
+  auto next_opening = [this](Opening* opening, int* game_id) -> bool {
+    Mutex::Lock lock(mutex_);
+    if (abort_) return false;
+    if (kTotalGames != -1) {
+      int cap = kTotalGames == -2 ? static_cast<int>(openings_.size())
+                                  : kTotalGames;
+      if (games_count_ >= cap) return false;
+    }
+    *game_id = games_count_++;
+    if (!openings_.empty()) {
+      if (player_options_[0][0].Get<bool>(kOpeningsMirroredId)) {
+        *opening = openings_[(*game_id / 2) % openings_.size()];
+      } else if (player_options_[0][0].Get<std::string>(kOpeningsModeId) ==
+                 "random") {
+        *opening = openings_[Random::Get().GetInt(0, openings_.size() - 1)];
+      } else {
+        *opening = openings_[*game_id % openings_.size()];
+      }
+    } else {
+      *opening = Opening{};
+    }
+    return true;
+  };
+
+  auto game_finished = [this](const FinishedGameData& data) {
+    GameInfo game_info;
+    game_info.game_result = data.result;
+    game_info.is_black = false;
+    game_info.game_id = data.game_id;
+    game_info.moves = data.moves;
+    game_info.initial_fen = data.opening.start_fen;
+    game_info.play_start_ply = data.opening.moves.size();
+    if (kTraining) {
+      TrainingDataWriter writer(data.game_id);
+      data.training_data.Write(&writer, data.result, data.adjudicated);
+      writer.Finalize();
+      game_info.training_filename = writer.GetFileName();
+    }
+    game_callback_(game_info);
+
+    {
+      Mutex::Lock lock(mutex_);
+      int r = data.result == GameResult::DRAW        ? 1
+              : data.result == GameResult::WHITE_WON ? 0
+                                                     : 2;
+      ++tournament_info_.results[r][0];
+      tournament_info_.move_count_ += data.move_count;
+      tournament_info_.nodes_total_ += data.nodes_total;
+      tournament_callback_(tournament_info_);
+    }
+  };
+
+  SyzygyTablebase* syzygy_tb;
+  {
+    Mutex::Lock lock(mutex_);
+    syzygy_tb = syzygy_tb_.get();
+  }
+
+  // Create BatchedSelfPlay outside the lock since its constructor calls
+  // next_opening which also acquires mutex_.
+  auto batched_ptr = std::make_unique<BatchedSelfPlay>(
+      options, visits, num_slots, next_opening, game_finished, syzygy_tb);
+
   std::list<std::unique_ptr<BatchedSelfPlay>>::iterator game_iter;
   bool aborted = false;
   {
     Mutex::Lock lock(mutex_);
-    batched_games_.emplace_front(std::make_unique<BatchedSelfPlay>(
-        options, visits, openings, syzygy_tb_.get()));
+    batched_games_.emplace_front(std::move(batched_ptr));
     game_iter = batched_games_.begin();
     aborted = abort_;
   }
   auto& batched = **game_iter;
 
   if (!aborted) batched.Play();
-
-  for (int i = 0; i < batched.NumGames(); i++) {
-    auto result = batched.GetGameResult(i);
-    if (result != GameResult::UNDECIDED) {
-      GameInfo game_info;
-      game_info.game_result = result;
-      game_info.is_black = false;
-      game_info.game_id = game_id + i;
-      game_info.moves = batched.GetMoves(i);
-      game_info.initial_fen = openings[i].start_fen;
-      game_info.play_start_ply = openings[i].moves.size();
-      if (kTraining) {
-        TrainingDataWriter writer(game_id + i);
-        batched.WriteTrainingData(i, &writer);
-        writer.Finalize();
-        game_info.training_filename = writer.GetFileName();
-      }
-      game_callback_(game_info);
-
-      {
-        Mutex::Lock lock(mutex_);
-        int r = result == GameResult::DRAW        ? 1
-                : result == GameResult::WHITE_WON ? 0
-                                                  : 2;
-        ++tournament_info_.results[r][0];
-        tournament_info_.move_count_ += batched.GetMoveCount(i);
-        tournament_info_.nodes_total_ += batched.GetNodesTotal(i);
-        tournament_callback_(tournament_info_);
-      }
-    }
-  }
 
   {
     Mutex::Lock lock(mutex_);
@@ -630,17 +640,14 @@ void SelfPlayTournament::Worker() {
       Mutex::Lock lock(mutex_);
       if (abort_) break;
       if (kBatchedGamesSize > 0) {
-        int to_take = kBatchedGamesSize;
+        // The next_opening callback handles game counting and limits,
+        // so we just check if there's potentially more work to do.
         if (kTotalGames != -1) {
           int cap = kTotalGames == -2
                         ? static_cast<int>(openings_.size())
                         : kTotalGames;
-          to_take = std::min(to_take, cap - games_count_);
+          if (games_count_ >= cap) break;
         }
-        if (to_take <= 0) break;
-        game_id = games_count_;
-        count = to_take;
-        games_count_ += to_take;
       } else if (multi_games_size_) {
         if (!player_options_[0][0].Get<bool>(kOpeningsMirroredId)) {
           throw Exception(
@@ -675,7 +682,7 @@ void SelfPlayTournament::Worker() {
       }
     }
     if (kBatchedGamesSize > 0) {
-      PlayBatchedGames(game_id, count);
+      PlayBatchedGames(kBatchedGamesSize);
     } else if (multi_games_size_) {
       PlayMultiGames(game_id, count);
     } else {

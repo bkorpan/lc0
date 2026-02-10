@@ -73,7 +73,7 @@ class SelfPlayTournament {
   void Worker();
   void PlayOneGame(int game_id);
   void PlayMultiGames(int game_id, size_t game_count);
-  void PlayBatchedGames(int game_id, int count);
+  void PlayBatchedGames(int num_slots);
   void SaveResults() REQUIRES(mutex_);
 
   Mutex mutex_;

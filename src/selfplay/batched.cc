@@ -140,20 +140,29 @@ class MEvaluator {
 }  // namespace
 
 BatchedSelfPlay::BatchedSelfPlay(PlayerOptions player, int visits_per_move,
-                                 const std::vector<Opening>& openings,
+                                 int num_slots,
+                                 NextOpeningCallback next_opening,
+                                 GameFinishedCallback game_finished,
                                  SyzygyTablebase* syzygy_tb)
     : player_(player),
       params_(*player.uci_options),
       visits_per_move_(visits_per_move),
-      syzygy_tb_(syzygy_tb) {
+      syzygy_tb_(syzygy_tb),
+      next_opening_(std::move(next_opening)),
+      game_finished_(std::move(game_finished)) {
   has_mlh_ = player_.backend->GetAttributes().has_mlh;
-  games_.reserve(openings.size());
-  for (const auto& opening : openings) {
+  games_.reserve(num_slots);
+  for (int i = 0; i < num_slots; i++) {
+    Opening opening;
+    int game_id;
+    if (!next_opening_(&opening, &game_id)) break;
     games_.push_back(GameState{
         .tree = std::make_shared<classic::NodeTree>(),
         .training_data = V6TrainingDataArray(
             params_.GetHistoryFill(), params_.GetHistoryFill(),
             pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE),
+        .opening = opening,
+        .game_id = game_id,
     });
     auto& game = games_.back();
     game.tree->ResetToPosition(opening.start_fen, {});
@@ -162,6 +171,63 @@ BatchedSelfPlay::BatchedSelfPlay(PlayerOptions player, int visits_per_move,
       game.tree->MakeMove(m);
     }
   }
+}
+
+void BatchedSelfPlay::InitializeGame(GameState& game,
+                                     const Opening& opening) {
+  game.tree->ResetToPosition(opening.start_fen, {});
+  for (Move m : opening.moves) {
+    if (game.tree->IsBlackToMove()) m.Flip();
+    game.tree->MakeMove(m);
+  }
+  game.training_data = V6TrainingDataArray(
+      params_.GetHistoryFill(), params_.GetHistoryFill(),
+      pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE);
+  game.result = GameResult::UNDECIDED;
+  game.visits_this_move = 0;
+  game.root_evaluated = false;
+  game.move_count = 0;
+  game.nodes_total = 0;
+  game.opening = opening;
+}
+
+std::vector<Move> BatchedSelfPlay::GetMovesForGame(
+    const GameState& game) const {
+  std::vector<Move> moves;
+  bool flip = !game.tree->IsBlackToMove();
+  for (classic::Node* node = game.tree->GetCurrentHead();
+       node != game.tree->GetGameBeginNode(); node = node->GetParent()) {
+    moves.push_back(node->GetParent()->GetEdgeToNode(node)->GetMove(flip));
+    flip = !flip;
+  }
+  std::reverse(moves.begin(), moves.end());
+  return moves;
+}
+
+void BatchedSelfPlay::FinishAndRecycleGame(GameState& game) {
+  bool adjudicated =
+      (game.result == GameResult::DRAW &&
+       game.tree->GetPositionHistory().Last().GetGamePly() >= 450);
+  FinishedGameData data{
+      .game_id = game.game_id,
+      .result = game.result,
+      .training_data = game.training_data,
+      .moves = GetMovesForGame(game),
+      .opening = game.opening,
+      .move_count = game.move_count,
+      .nodes_total = game.nodes_total,
+      .adjudicated = adjudicated,
+  };
+  game_finished_(data);
+
+  Opening opening;
+  int game_id;
+  if (next_opening_(&opening, &game_id)) {
+    game.game_id = game_id;
+    InitializeGame(game, opening);
+  }
+  // If next_opening_ returns false, game.result stays non-UNDECIDED and
+  // the slot will be skipped in future iterations.
 }
 
 void BatchedSelfPlay::Play() {
@@ -177,7 +243,10 @@ void BatchedSelfPlay::Play() {
       if (game.result != GameResult::UNDECIDED) continue;
 
       CheckGameResult(game);
-      if (game.result != GameResult::UNDECIDED) continue;
+      if (game.result != GameResult::UNDECIDED) {
+        FinishAndRecycleGame(game);
+        if (game.result != GameResult::UNDECIDED) continue;
+      }
 
       // If enough visits, pick and play a move.
       if (game.visits_this_move >= visits_per_move_) {
@@ -185,7 +254,10 @@ void BatchedSelfPlay::Play() {
         game.visits_this_move = 0;
         game.root_evaluated = false;
         CheckGameResult(game);
-        if (game.result != GameResult::UNDECIDED) continue;
+        if (game.result != GameResult::UNDECIDED) {
+          FinishAndRecycleGame(game);
+          if (game.result != GameResult::UNDECIDED) continue;
+        }
       }
 
       any_active = true;
@@ -585,27 +657,6 @@ void BatchedSelfPlay::CheckGameResult(GameState& game) {
       }
     }
   }
-}
-
-std::vector<Move> BatchedSelfPlay::GetMoves(int idx) const {
-  const auto& game = games_[idx];
-  std::vector<Move> moves;
-  bool flip = !game.tree->IsBlackToMove();
-  for (classic::Node* node = game.tree->GetCurrentHead();
-       node != game.tree->GetGameBeginNode(); node = node->GetParent()) {
-    moves.push_back(node->GetParent()->GetEdgeToNode(node)->GetMove(flip));
-    flip = !flip;
-  }
-  std::reverse(moves.begin(), moves.end());
-  return moves;
-}
-
-void BatchedSelfPlay::WriteTrainingData(int idx,
-                                        TrainingDataWriter* writer) const {
-  bool adjudicated =
-      (games_[idx].result == GameResult::DRAW &&
-       games_[idx].tree->GetPositionHistory().Last().GetGamePly() >= 450);
-  games_[idx].training_data.Write(writer, games_[idx].result, adjudicated);
 }
 
 }  // namespace lczero

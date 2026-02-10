@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "chess/pgn.h"
@@ -39,21 +40,34 @@
 
 namespace lczero {
 
+// Called to get the next opening. Returns true + populates opening/game_id
+// if there's a game to play, false if no more games.
+using NextOpeningCallback = std::function<bool(Opening*, int* game_id)>;
+
+// Data passed to the game-finished callback.
+struct FinishedGameData {
+  int game_id;
+  GameResult result;
+  const V6TrainingDataArray& training_data;
+  std::vector<Move> moves;
+  Opening opening;
+  int move_count;
+  uint64_t nodes_total;
+  bool adjudicated;
+};
+
+// Called when a game finishes.
+using GameFinishedCallback = std::function<void(const FinishedGameData&)>;
+
 class BatchedSelfPlay {
  public:
-  BatchedSelfPlay(PlayerOptions player, int visits_per_move,
-                  const std::vector<Opening>& openings,
+  BatchedSelfPlay(PlayerOptions player, int visits_per_move, int num_slots,
+                  NextOpeningCallback next_opening,
+                  GameFinishedCallback game_finished,
                   SyzygyTablebase* syzygy_tb);
 
   void Play();
   void Abort();
-
-  int NumGames() const { return static_cast<int>(games_.size()); }
-  GameResult GetGameResult(int idx) const { return games_[idx].result; }
-  std::vector<Move> GetMoves(int idx) const;
-  void WriteTrainingData(int idx, TrainingDataWriter* writer) const;
-  int GetMoveCount(int idx) const { return games_[idx].move_count; }
-  uint64_t GetNodesTotal(int idx) const { return games_[idx].nodes_total; }
 
  private:
   struct GameState {
@@ -64,6 +78,8 @@ class BatchedSelfPlay {
     bool root_evaluated = false;
     int move_count = 0;
     uint64_t nodes_total = 0;
+    Opening opening;
+    int game_id = -1;
   };
 
   struct LeafToEval {
@@ -75,6 +91,10 @@ class BatchedSelfPlay {
     EvalResult eval;
     bool is_root;
   };
+
+  void InitializeGame(GameState& game, const Opening& opening);
+  std::vector<Move> GetMovesForGame(const GameState& game) const;
+  void FinishAndRecycleGame(GameState& game);
 
   classic::Node* PuctWalk(GameState& game, std::vector<classic::Node*>& path,
                           PositionHistory& history);
@@ -91,6 +111,8 @@ class BatchedSelfPlay {
   bool abort_ = false;
   bool has_mlh_ = false;
   std::vector<GameState> games_;
+  NextOpeningCallback next_opening_;
+  GameFinishedCallback game_finished_;
 };
 
 }  // namespace lczero
