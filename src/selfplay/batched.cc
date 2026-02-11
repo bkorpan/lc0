@@ -276,10 +276,15 @@ void BatchedSelfPlay::Play() {
         auto legal_moves = board.GenerateLegalMoves();
 
         // If no legal moves, this is a terminal node (checkmate/stalemate).
+        // Use WHITE_WON for checkmate (= "parent won") to match node value
+        // convention used by search.cc, NOT ComputeGameResult() which gives
+        // absolute color results.
         if (legal_moves.empty()) {
-          auto result = history.ComputeGameResult();
-          if (result == GameResult::UNDECIDED) result = GameResult::DRAW;
-          leaf->MakeTerminal(result);
+          if (board.IsUnderCheck()) {
+            leaf->MakeTerminal(GameResult::WHITE_WON);
+          } else {
+            leaf->MakeTerminal(GameResult::DRAW);
+          }
           Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
           game.visits_this_move++;
           continue;
