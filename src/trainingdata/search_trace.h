@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -67,10 +68,11 @@ class SearchTraceWriter {
     file_.write(reinterpret_cast<const char*>(header), sizeof(header));
   }
 
-  // Write a complete game's trace data to the file.
+  // Write a complete game's trace data to the file. Thread-safe.
   void WriteGame(
       int8_t result, const std::vector<uint16_t>& played_moves,
       const std::vector<std::vector<std::vector<uint16_t>>>& ply_traces) {
+    std::lock_guard<std::mutex> lock(mutex_);
     uint16_t num_plies = static_cast<uint16_t>(played_moves.size());
     uint8_t reserved = 0;
 
@@ -99,6 +101,7 @@ class SearchTraceWriter {
   }
 
   void Finalize() {
+    std::lock_guard<std::mutex> lock(mutex_);
     // Seek back to write num_games in the header.
     file_.seekp(8);
     file_.write(reinterpret_cast<const char*>(&num_games_), 4);
@@ -109,6 +112,7 @@ class SearchTraceWriter {
   static constexpr uint32_t kMagic = 0x5443484D;  // "MCHT"
   static constexpr uint32_t kVersion = 1;
 
+  std::mutex mutex_;
   std::ofstream file_;
   uint32_t num_games_ = 0;
 };

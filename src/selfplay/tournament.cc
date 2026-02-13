@@ -612,12 +612,11 @@ void SelfPlayTournament::PlayBatchedGames(int num_slots) {
   {
     Mutex::Lock lock(mutex_);
     syzygy_tb = syzygy_tb_.get();
-  }
-
-  // Create trace writer if requested.
-  if (!kSearchTraceFile.empty() && !search_trace_writer_) {
-    search_trace_writer_ =
-        std::make_unique<SearchTraceWriter>(kSearchTraceFile);
+    // Create trace writer if requested (under lock for thread safety).
+    if (!kSearchTraceFile.empty() && !search_trace_writer_) {
+      search_trace_writer_ =
+          std::make_unique<SearchTraceWriter>(kSearchTraceFile);
+    }
   }
 
   // Create BatchedSelfPlay outside the lock since its constructor calls
