@@ -102,6 +102,10 @@ const OptionId kBatchedGamesId{
     "batched-games", "BatchedGames",
     "Number of games per worker in cross-game batched MCTS mode. "
     "Set to 0 to use standard per-game MCTS mode."};
+const OptionId kSearchTraceFileId{
+    "search-trace-file", "SearchTraceFile",
+    "Output file for MCTS search trace data (binary format). "
+    "Only used with batched-games mode."};
 
 }  // namespace
 
@@ -142,6 +146,7 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
 
   options->Add<StringOption>(kSyzygyTablebaseId);
   options->Add<IntOption>(kBatchedGamesId, 0, 1024) = 0;
+  options->Add<StringOption>(kSearchTraceFileId) = "";
   SelfPlayGame::PopulateUciParams(options);
 
   auto defaults = options->GetMutableDefaultsOptions();
@@ -184,7 +189,8 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
       kTournamentResultsFile(
           options.Get<std::string>(kTournamentResultsFileId)),
       kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)),
-      kBatchedGamesSize(options.Get<int>(kBatchedGamesId)) {
+      kBatchedGamesSize(options.Get<int>(kBatchedGamesId)),
+      kSearchTraceFile(options.Get<std::string>(kSearchTraceFileId)) {
   multi_games_size_ = std::max(kPolicyGamesSize, kValueGamesSize);
   std::string book = options.Get<std::string>(kOpeningsFileId);
   if (!book.empty()) {
@@ -608,10 +614,17 @@ void SelfPlayTournament::PlayBatchedGames(int num_slots) {
     syzygy_tb = syzygy_tb_.get();
   }
 
+  // Create trace writer if requested.
+  if (!kSearchTraceFile.empty() && !search_trace_writer_) {
+    search_trace_writer_ =
+        std::make_unique<SearchTraceWriter>(kSearchTraceFile);
+  }
+
   // Create BatchedSelfPlay outside the lock since its constructor calls
   // next_opening which also acquires mutex_.
   auto batched_ptr = std::make_unique<BatchedSelfPlay>(
-      options, visits, num_slots, next_opening, game_finished, syzygy_tb);
+      options, visits, num_slots, next_opening, game_finished, syzygy_tb,
+      search_trace_writer_.get());
 
   std::list<std::unique_ptr<BatchedSelfPlay>>::iterator game_iter;
   bool aborted = false;
@@ -754,6 +767,10 @@ SelfPlayTournament::~SelfPlayTournament() {
 }
 
 void SelfPlayTournament::SaveResults() {
+  if (search_trace_writer_) {
+    search_trace_writer_->Finalize();
+    search_trace_writer_.reset();
+  }
   if (kTournamentResultsFile.empty()) return;
   std::ofstream output(kTournamentResultsFile, std::ios_base::app);
   auto p1name =

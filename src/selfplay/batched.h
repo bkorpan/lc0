@@ -36,6 +36,7 @@
 #include "search/classic/params.h"
 #include "selfplay/game.h"
 #include "syzygy/syzygy.h"
+#include "trainingdata/search_trace.h"
 #include "trainingdata/trainingdata.h"
 
 namespace lczero {
@@ -64,7 +65,8 @@ class BatchedSelfPlay {
   BatchedSelfPlay(PlayerOptions player, int visits_per_move, int num_slots,
                   NextOpeningCallback next_opening,
                   GameFinishedCallback game_finished,
-                  SyzygyTablebase* syzygy_tb);
+                  SyzygyTablebase* syzygy_tb,
+                  SearchTraceWriter* trace_writer = nullptr);
 
   void Play();
   void Abort();
@@ -80,12 +82,17 @@ class BatchedSelfPlay {
     uint64_t nodes_total = 0;
     Opening opening;
     int game_id = -1;
+    // Per-game search trace buffers (only used when trace_writer_ != null).
+    std::vector<uint16_t> trace_played_moves;
+    std::vector<std::vector<std::vector<uint16_t>>> trace_ply_traces;
+    std::vector<std::vector<uint16_t>> trace_current_ply;
   };
 
   struct LeafToEval {
     int game_idx;
     classic::Node* leaf;
     std::vector<classic::Node*> path;
+    std::vector<uint16_t> trace_moves;
     PositionHistory history;
     std::vector<Move> legal_moves;
     EvalResult eval;
@@ -97,6 +104,7 @@ class BatchedSelfPlay {
   void FinishAndRecycleGame(GameState& game);
 
   classic::Node* PuctWalk(GameState& game, std::vector<classic::Node*>& path,
+                          std::vector<uint16_t>& trace_moves,
                           PositionHistory& history);
   void ProcessNNResult(LeafToEval& leaf);
   void Backpropagate(const std::vector<classic::Node*>& path, float v, float d,
@@ -113,6 +121,7 @@ class BatchedSelfPlay {
   std::vector<GameState> games_;
   NextOpeningCallback next_opening_;
   GameFinishedCallback game_finished_;
+  SearchTraceWriter* trace_writer_;
 };
 
 }  // namespace lczero

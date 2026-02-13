@@ -31,6 +31,7 @@
 #include <cmath>
 #include <limits>
 
+#include "neural/encoder.h"
 #include "utils/fastmath.h"
 #include "utils/random.h"
 
@@ -143,13 +144,15 @@ BatchedSelfPlay::BatchedSelfPlay(PlayerOptions player, int visits_per_move,
                                  int num_slots,
                                  NextOpeningCallback next_opening,
                                  GameFinishedCallback game_finished,
-                                 SyzygyTablebase* syzygy_tb)
+                                 SyzygyTablebase* syzygy_tb,
+                                 SearchTraceWriter* trace_writer)
     : player_(player),
       params_(*player.uci_options),
       visits_per_move_(visits_per_move),
       syzygy_tb_(syzygy_tb),
       next_opening_(std::move(next_opening)),
-      game_finished_(std::move(game_finished)) {
+      game_finished_(std::move(game_finished)),
+      trace_writer_(trace_writer) {
   has_mlh_ = player_.backend->GetAttributes().has_mlh;
   games_.reserve(num_slots);
   for (int i = 0; i < num_slots; i++) {
@@ -163,6 +166,9 @@ BatchedSelfPlay::BatchedSelfPlay(PlayerOptions player, int visits_per_move,
             pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE),
         .opening = opening,
         .game_id = game_id,
+        .trace_played_moves = {},
+        .trace_ply_traces = {},
+        .trace_current_ply = {},
     });
     auto& game = games_.back();
     game.tree->ResetToPosition(opening.start_fen, {});
@@ -189,6 +195,11 @@ void BatchedSelfPlay::InitializeGame(GameState& game,
   game.move_count = 0;
   game.nodes_total = 0;
   game.opening = opening;
+  if (trace_writer_) {
+    game.trace_played_moves.clear();
+    game.trace_ply_traces.clear();
+    game.trace_current_ply.clear();
+  }
 }
 
 std::vector<Move> BatchedSelfPlay::GetMovesForGame(
@@ -205,6 +216,13 @@ std::vector<Move> BatchedSelfPlay::GetMovesForGame(
 }
 
 void BatchedSelfPlay::FinishAndRecycleGame(GameState& game) {
+  if (trace_writer_) {
+    int8_t result = game.result == GameResult::WHITE_WON   ? 1
+                    : game.result == GameResult::BLACK_WON ? -1
+                                                           : 0;
+    trace_writer_->WriteGame(result, game.trace_played_moves,
+                             game.trace_ply_traces);
+  }
   bool adjudicated =
       (game.result == GameResult::DRAW &&
        game.tree->GetPositionHistory().Last().GetGamePly() >= 450);
@@ -264,11 +282,13 @@ void BatchedSelfPlay::Play() {
 
       // Do one MCTS iteration: walk tree to find leaf.
       std::vector<classic::Node*> path;
+      std::vector<uint16_t> trace_moves;
       PositionHistory history = game.tree->GetPositionHistory();
-      classic::Node* leaf = PuctWalk(game, path, history);
+      classic::Node* leaf = PuctWalk(game, path, trace_moves, history);
 
       if (leaf->IsTerminal()) {
         Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+        if (trace_writer_) game.trace_current_ply.push_back(std::move(trace_moves));
         game.visits_this_move++;
       } else {
         // Need NN eval: expand leaf, add to batch.
@@ -286,6 +306,7 @@ void BatchedSelfPlay::Play() {
             leaf->MakeTerminal(GameResult::DRAW);
           }
           Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+          if (trace_writer_) game.trace_current_ply.push_back(std::move(trace_moves));
           game.visits_this_move++;
           continue;
         }
@@ -296,12 +317,14 @@ void BatchedSelfPlay::Play() {
           if (!board.HasMatingMaterial()) {
             leaf->MakeTerminal(GameResult::DRAW);
             Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+            if (trace_writer_) game.trace_current_ply.push_back(std::move(trace_moves));
             game.visits_this_move++;
             continue;
           }
           if (history.Last().GetRule50Ply() >= 100) {
             leaf->MakeTerminal(GameResult::DRAW);
             Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+            if (trace_writer_) game.trace_current_ply.push_back(std::move(trace_moves));
             game.visits_this_move++;
             continue;
           }
@@ -309,6 +332,7 @@ void BatchedSelfPlay::Play() {
           if (repetitions >= 2) {
             leaf->MakeTerminal(GameResult::DRAW);
             Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+            if (trace_writer_) game.trace_current_ply.push_back(std::move(trace_moves));
             game.visits_this_move++;
             continue;
           } else if (repetitions == 1 && params_.GetTwoFoldDraws()) {
@@ -320,6 +344,7 @@ void BatchedSelfPlay::Play() {
                                  static_cast<float>(cycle_length),
                                  classic::Node::Terminal::TwoFold);
               Backpropagate(path, leaf->GetWL(), leaf->GetD(), leaf->GetM());
+              if (trace_writer_) game.trace_current_ply.push_back(std::move(trace_moves));
               game.visits_this_move++;
               continue;
             }
@@ -330,6 +355,7 @@ void BatchedSelfPlay::Play() {
             .game_idx = gi,
             .leaf = leaf,
             .path = std::move(path),
+            .trace_moves = std::move(trace_moves),
             .history = history,
             .legal_moves = std::move(legal_moves),
             .eval = {},
@@ -357,6 +383,10 @@ void BatchedSelfPlay::Play() {
         ProcessNNResult(leaf_info);
         Backpropagate(leaf_info.path, -leaf_info.eval.q, leaf_info.eval.d,
                       leaf_info.eval.m);
+        if (trace_writer_) {
+          games_[leaf_info.game_idx].trace_current_ply.push_back(
+              std::move(leaf_info.trace_moves));
+        }
         games_[leaf_info.game_idx].visits_this_move++;
         leaf_info.game_idx = -1;  // Mark as already processed.
       }
@@ -377,6 +407,10 @@ void BatchedSelfPlay::Play() {
         ProcessNNResult(leaf_info);
         Backpropagate(leaf_info.path, -leaf_info.eval.q, leaf_info.eval.d,
                       leaf_info.eval.m);
+        if (trace_writer_) {
+          games_[leaf_info.game_idx].trace_current_ply.push_back(
+              std::move(leaf_info.trace_moves));
+        }
         games_[leaf_info.game_idx].visits_this_move++;
       }
     }
@@ -387,7 +421,7 @@ void BatchedSelfPlay::Abort() { abort_ = true; }
 
 classic::Node* BatchedSelfPlay::PuctWalk(
     GameState& game, std::vector<classic::Node*>& path,
-    PositionHistory& history) {
+    std::vector<uint16_t>& trace_moves, PositionHistory& history) {
   auto* node = game.tree->GetCurrentHead();
   path.push_back(node);
 
@@ -435,6 +469,12 @@ classic::Node* BatchedSelfPlay::PuctWalk(
     if (!best_edge_iter) break;
     classic::Node* best_child = best_edge_iter.GetOrSpawnNode(node);
     classic::Edge* best_edge = best_edge_iter.edge();
+
+    // Record NN index for search trace. Edge moves are in side-to-move
+    // perspective, so use transform=0 (identity).
+    if (trace_writer_) {
+      trace_moves.push_back(MoveToNNIndex(best_edge->GetMove(), 0));
+    }
 
     // TwoFold depth correction on tree reuse: if the selected child was
     // marked as a TwoFold terminal in a previous search but the repetition
@@ -616,6 +656,14 @@ void BatchedSelfPlay::MakeGameMove(GameState& game) {
                          played_eval, false, best_move, played_move,
                          legal_moves, nneval,
                          params_.GetPolicySoftmaxTemp());
+
+  // Finalize search trace for this ply.
+  if (trace_writer_) {
+    uint16_t played_nn_idx = MoveToNNIndex(played_move, 0);
+    game.trace_played_moves.push_back(played_nn_idx);
+    game.trace_ply_traces.push_back(std::move(game.trace_current_ply));
+    game.trace_current_ply.clear();
+  }
 
   game.move_count++;
   game.nodes_total += root->GetN();

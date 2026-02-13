@@ -34,6 +34,7 @@
 #include "neural/register.h"
 #include "selfplay/batched.h"
 #include "selfplay/game.h"
+#include "trainingdata/search_trace.h"
 #include "selfplay/multigame.h"
 #include "utils/mutex.h"
 #include "utils/optionsdict.h"
@@ -116,6 +117,8 @@ class SelfPlayTournament {
   const std::string kTournamentResultsFile;
   const float kDiscardedStartChance;
   const int kBatchedGamesSize;
+  const std::string kSearchTraceFile;
+  std::unique_ptr<SearchTraceWriter> search_trace_writer_;
 };
 
 }  // namespace lczero
